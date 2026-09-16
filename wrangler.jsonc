@@ -1,14 +1,24 @@
-/**
- * For more details on how to configure Wrangler, refer to:
- * https://developers.cloudflare.com/workers/wrangler/configuration/
- */
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "podium-mcp",
 	"main": "src/index.ts",
 	"compatibility_date": "2026-07-02",
 	"compatibility_flags": ["nodejs_compat"],
-	"observability": {
-		"enabled": true,
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "MCP_OBJECT",
+				"class_name": "PodiumMCP"
+			}
+		]
 	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": ["PodiumMCP"]
+		}
+	],
+	"observability": {
+		"enabled": true
+	}
 }
