@@ -1,66 +1,68 @@
-import { McpServer } from "@modelcontextprotocol/server";
-import { createMcpHandler } from "agents/mcp/server";
+import { McpAgent } from "agents/mcp";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { podium, type Env } from "./podium";
 
-function createServer() {
-	const server = new McpServer({
-		name: "Authless Calculator",
-		version: "1.0.0",
-	});
+export class PodiumMCP extends McpAgent<Env> {
+  server = new McpServer({ name: "podium-adore", version: "1.0.0" });
 
-	server.registerTool(
-		"add",
-		{ inputSchema: z.object({ a: z.number(), b: z.number() }) },
-		async ({ a, b }) => ({
-			content: [{ type: "text", text: String(a + b) }],
-		}),
-	);
+  async init() {
+    // Each "tool" is one thing Claude is allowed to ask Podium for.
+    this.server.tool(
+      "list_conversations",
+      "List recent Podium conversations for a location, newest first.",
+      {
+        locationId: z.string().describe("Auburn or Lansvale"),
+        since: z.string().describe("Only conversations after this date/time"),
+        limit: z.number().max(100).default(50),
+      },
+      async ({ locationId, since, limit }) => {
+        const data = await podium(this.env,
+          `conversations?locationId=${locationId}&since=${encodeURIComponent(since)}&limit=${limit}`);
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      }
+    );
 
-	server.registerTool(
-		"calculate",
-		{
-			inputSchema: z.object({
-				operation: z.enum(["add", "subtract", "multiply", "divide"]),
-				a: z.number(),
-				b: z.number(),
-			}),
-		},
-		async ({ operation, a, b }) => {
-			let result: number;
-			switch (operation) {
-				case "add":
-					result = a + b;
-					break;
-				case "subtract":
-					result = a - b;
-					break;
-				case "multiply":
-					result = a * b;
-					break;
-				case "divide":
-					if (b === 0)
-						return {
-							content: [
-								{
-									type: "text",
-									text: "Error: Cannot divide by zero",
-								},
-							],
-						};
-					result = a / b;
-					break;
-			}
-			return { content: [{ type: "text", text: String(result) }] };
-		},
-	);
+    this.server.tool(
+      "get_conversation",
+      "Read the full message history of one conversation.",
+      { conversationId: z.string() },
+      async ({ conversationId }) => {
+        const data = await podium(this.env, `conversations/${conversationId}/messages`);
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      }
+    );
 
-	return server;
+    this.server.tool(
+      "list_reviews",
+      "List reviews for a location.",
+      { locationId: z.string(), since: z.string() },
+      async ({ locationId, since }) => {
+        const data = await podium(this.env,
+          `reviews?locationId=${locationId}&since=${encodeURIComponent(since)}`);
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      }
+    );
+  }
 }
 
-const handler = createMcpHandler(createServer);
-
 export default {
-	fetch(request: Request, env: Env, ctx: ExecutionContext) {
-		return handler(request, env, ctx);
-	},
-} satisfies ExportedHandler<Env>;
+  fetch(request: Request, env: Env, ctx: ExecutionContext) {
+    const url = new URL(request.url);
+
+    // Anything not using the secret address gets a blank "not found",
+    // so a stranger can't even tell there's a server here.
+    if (!url.pathname.startsWith(`/${env.SECRET_PATH}`)) {
+      return new Response("Not found", { status: 404 });
+    }
+    const rest = url.pathname.slice(`/${env.SECRET_PATH}`.length);
+
+    if (rest === "/mcp") {
+      return PodiumMCP.serve(`/${env.SECRET_PATH}/mcp`).fetch(request, env, ctx);
+    }
+    if (rest === "/sse" || rest === "/sse/message") {
+      return PodiumMCP.serveSSE(`/${env.SECRET_PATH}/sse`).fetch(request, env, ctx);
+    }
+    return new Response("Not found", { status: 404 });
+  },
+};
