@@ -615,6 +615,132 @@ export class PodiumMCP extends McpAgent<Env> {
         });
       }
     );
+
+    // 10. CALLS ──────────────────────────────────────────────────────────────
+    // Added 18 Sep 2026. Until now the connector read messages only, so the
+    // 6:30pm follow-up report carried the line "Calls not covered". Calls are
+    // roughly two thirds of Adore's Podium volume (337 incoming in 30 days
+    // against 87 conversations), so that was the bigger half of the inbox.
+    //
+    // What Podium's v4 API does and does not give you, checked against the
+    // docs rather than assumed: you get status, direction, duration and
+    // whether a voicemail exists. There is NO call recording, NO call
+    // transcript and NO AI call summary on any v4 endpoint. Voicemail is the
+    // one place spoken words are available, and only as a transcript.
+    this.server.tool(
+      "list_calls",
+      "List Podium calls for a location. Returns status, direction, duration and whether a voicemail " +
+      "was left. NOTE: on this list endpoint Podium always returns startedAt, endedAt, isPrivate and " +
+      "conversationUid as null — use get_call for those. There are no call recordings, transcripts or " +
+      "AI summaries anywhere in Podium's v4 API; voicemail transcripts are the only spoken content.",
+      {
+        locationUid: z.string().optional().describe("Lansvale is 01928ec4-3365-76f1-a5f2-0830a05701b0."),
+        since: z.string().optional().describe("ISO 8601. Filters on updatedAt, not when the call happened."),
+        limit: z.number().min(1).max(100).default(50),
+        order: z.enum(["asc", "desc"]).default("desc"),
+      },
+      async ({ locationUid, since, limit, order }) => {
+        let path = `calls?limit=${limit}&order=${order}`;
+        if (locationUid) path += `&locationUid=${locationUid}`;
+        if (since) path += `&since=${encodeURIComponent(since)}`;
+        return text(await podiumRequest(this.env, "GET", path));
+      }
+    );
+
+    this.server.tool(
+      "get_call",
+      "Read one call in full, including startedAt, endedAt and conversationUid, which the list endpoint " +
+      "leaves null. Set includeVoicemail to also fetch the voicemail transcript if one was left.",
+      {
+        uid: z.string().describe("Call UUID from list_calls."),
+        includeVoicemail: z.boolean().default(false),
+      },
+      async ({ uid, includeVoicemail }) => {
+        const call = unwrap(await podiumRequest(this.env, "GET", `calls/${uid}`));
+        if (!includeVoicemail) return text(call);
+        let voicemail: unknown = null;
+        try {
+          voicemail = unwrap(await podiumRequest(this.env, "GET", `calls/${uid}/voicemail`));
+        } catch {
+          // Podium returns 404 when no voicemail was left. Not an error worth failing on.
+          voicemail = { none: true };
+        }
+        return text({ call, voicemail });
+      }
+    );
+
+    this.server.tool(
+      "call_activity",
+      "Summarise recent call activity for a location and pull the transcript of every voicemail left in " +
+      "the window. Groups calls by their real Podium status rather than guessing which ones count as " +
+      "missed, so you can see the actual status values before deciding. Use this to find callers who " +
+      "never got through and hear what they wanted.",
+      {
+        locationUid: z.string().describe("Lansvale is 01928ec4-3365-76f1-a5f2-0830a05701b0."),
+        since: z.string().describe("ISO 8601, e.g. 2026-09-15T00:00:00Z."),
+        limit: z.number().min(1).max(100).default(100).describe("Calls to read."),
+        maxVoicemails: z.number().min(0).max(25).default(10)
+          .describe("Each voicemail costs one extra API call, so this is capped."),
+      },
+      async ({ locationUid, since, limit, maxVoicemails }) => {
+        const list: any = await podiumRequest(this.env, "GET",
+          `calls?locationUid=${locationUid}&since=${encodeURIComponent(since)}&limit=${limit}&order=desc`);
+        const calls: any[] = Array.isArray(list?.data) ? list.data : [];
+
+        const byStatus: Record<string, number> = {};
+        const byDirection: Record<string, number> = {};
+        for (const c of calls) {
+          byStatus[c?.status ?? "unknown"] = (byStatus[c?.status ?? "unknown"] ?? 0) + 1;
+          byDirection[c?.direction ?? "unknown"] = (byDirection[c?.direction ?? "unknown"] ?? 0) + 1;
+        }
+
+        // Voicemail is the only place a caller's own words are available.
+        const withVoicemail = calls.filter((c) => c?.hasVoicemail).slice(0, maxVoicemails);
+        const voicemails: any[] = [];
+        for (const c of withVoicemail) {
+          try {
+            const vm: any = unwrap(await podiumRequest(this.env, "GET", `calls/${c.uid}/voicemail`));
+            voicemails.push({
+              callUid: c.uid,
+              from: c.customerPhoneNumber,
+              status: c.status,
+              durationSeconds: vm?.durationSeconds,
+              transcript: vm?.transcript ?? "(not transcribed yet)",
+            });
+          } catch (e) {
+            voicemails.push({ callUid: c.uid, from: c.customerPhoneNumber, error: String(e).slice(0, 200) });
+          }
+        }
+
+        // Inbound calls that connected to nobody are the follow-up list. No
+        // status is hardcoded as "missed" here; the caller reads statusCounts
+        // and decides, because Podium documents 21 status values.
+        const inboundShort = calls
+          .filter((c) => c?.direction === "inbound")
+          .map((c) => ({
+            uid: c.uid,
+            from: c.customerPhoneNumber,
+            status: c.status,
+            durationSeconds: c.durationSeconds,
+            hasVoicemail: !!c.hasVoicemail,
+            handledByUserUid: c.userUid ?? null,
+            updatedAt: c.updatedAt,
+          }));
+
+        return text({
+          window: { locationUid, since, callsRead: calls.length, totalItems: list?.metadata?.totalItems ?? null },
+          statusCounts: byStatus,
+          directionCounts: byDirection,
+          voicemailsFound: calls.filter((c) => c?.hasVoicemail).length,
+          voicemailsRead: voicemails.length,
+          voicemails,
+          inboundCalls: inboundShort,
+          limits:
+            "Podium's v4 API has no call recording, no call transcript and no AI call summary. " +
+            "Voicemail transcripts are the only spoken content available. Times are UTC; Sydney is +10 until 4 Oct 2026.",
+        });
+      }
+    );
   }
 }
 
