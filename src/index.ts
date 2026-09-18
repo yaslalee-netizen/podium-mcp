@@ -564,6 +564,57 @@ export class PodiumMCP extends McpAgent<Env> {
         return text({ sent: true, dataFeedUid, event, result });
       }
     );
+
+    // 9. UPDATE A LOCATION ────────────────────────────────────────────────────
+    // Added 18 Sep 2026 for a specific job: Podium's own automations merge in a
+    // "Location Name" field, which reads displayName. Adore's displayName was
+    // "Adore Rugs & Flooring Lansvale", so every templated message named a
+    // showroom that closes in Dec 2026 — including messages to Auburn
+    // customers, since the Podium number is published as Auburn's. Podium's UI
+    // has no field for displayName, so it is changed here.
+    this.server.tool(
+      "update_location",
+      "Change a Podium location's name, display name or phone number. displayName is what Podium's " +
+      "automation templates merge in as 'Location Name', so it shows up in messages to customers. " +
+      "Shows the before and after and changes nothing until confirmed: true.",
+      {
+        uid: z.string().describe("Location UUID. Lansvale is 01928ec4-3365-76f1-a5f2-0830a05701b0."),
+        displayName: z.string().optional().describe("What templates merge in as 'Location Name'."),
+        name: z.string().optional(),
+        phoneNumber: z.string().optional().describe("E164, e.g. +61285260174."),
+        confirmed: z.boolean().default(false).describe("Set true to actually write."),
+      },
+      async ({ uid, displayName, name, phoneNumber, confirmed }) => {
+        if (phoneNumber && !/^\+[1-9]\d{1,15}$/.test(phoneNumber)) {
+          throw new Error(`Podium requires E164 phone numbers like +61285260174. Got "${phoneNumber}". Nothing was changed.`);
+        }
+        const patch = {
+          ...(displayName ? { displayName } : {}),
+          ...(name ? { name } : {}),
+          ...(phoneNumber ? { phoneNumber } : {}),
+        };
+        if (Object.keys(patch).length === 0) {
+          throw new Error("Give at least one of displayName, name or phoneNumber. Nothing was changed.");
+        }
+        const before: any = unwrap(await podiumRequest(this.env, "GET", `locations/${uid}`));
+        if (!confirmed) {
+          return text({
+            current: { name: before?.name, displayName: before?.displayName, phoneNumber: before?.phoneNumber },
+            wouldChangeTo: patch,
+            nothingWritten: true,
+            note: "displayName appears in customer-facing automated messages. Call again with confirmed: true to write.",
+          });
+        }
+        const result = await podiumRequest(this.env, "PATCH", `locations/${uid}`, patch);
+        const after: any = unwrap(await podiumRequest(this.env, "GET", `locations/${uid}`));
+        return text({
+          changed: true,
+          before: { name: before?.name, displayName: before?.displayName, phoneNumber: before?.phoneNumber },
+          after: { name: after?.name, displayName: after?.displayName, phoneNumber: after?.phoneNumber },
+          result,
+        });
+      }
+    );
   }
 }
 
